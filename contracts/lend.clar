@@ -56,6 +56,12 @@
 (define-constant ERR-DEPOSIT-TRANSFER-FAILED u1015)
 (define-constant ERR-WITHDRAWAL-TRANSFER-FAILED u1016)
 (define-constant ERR-BORROW-TRANSFER-FAILED u1017)
+(define-constant ERR-INVALID-TOKEN u1018)
+
+;; Function to validate token-id
+(define-private (is-valid-token (token-id (string-ascii 10)))
+  (or (is-eq token-id TOKEN-STX) (is-eq token-id TOKEN-XBTC))
+)
 
 ;; Initialize protocol with default settings
 (define-public (initialize-protocol)
@@ -93,49 +99,56 @@
 ;; Deposit tokens to earn interest
 (define-public (deposit (token-id (string-ascii 10)) (amount uint))
   (let 
-    ((current-height block-height)
-     (pool-opt (map-get? token-pools { token-id: token-id })))
+    ((current-height block-height))
     
-    ;; Check if pool exists
-    (asserts! (is-some pool-opt) (err ERR-POOL-NOT-FOUND))
+    ;; Validate token
+    (asserts! (is-valid-token token-id) (err ERR-INVALID-TOKEN))
     
-    (let
-      ((pool (unwrap-panic pool-opt))
-       (updated-pool (merge pool { total-deposited: (+ (get total-deposited pool) amount) })))
+    (let 
+      ((pool-opt (map-get? token-pools { token-id: token-id })))
       
-      ;; Update the pool's total deposited amount
-      (map-set token-pools { token-id: token-id } updated-pool)
+      ;; Check if pool exists
+      (asserts! (is-some pool-opt) (err ERR-POOL-NOT-FOUND))
       
-      ;; Record the user's deposit
-      (let ((prev-deposit-opt (map-get? deposits { user: tx-sender, token-id: token-id })))
-        (if (is-some prev-deposit-opt)
-          (let ((prev-deposit (unwrap-panic prev-deposit-opt)))
+      (let
+        ((pool (unwrap-panic pool-opt))
+         (updated-pool (merge pool { total-deposited: (+ (get total-deposited pool) amount) }))
+         (safe-token-id token-id)) ;; Create a safe copy after validation
+        
+        ;; Update the pool's total deposited amount
+        (map-set token-pools { token-id: safe-token-id } updated-pool)
+        
+        ;; Record the user's deposit
+        (let ((prev-deposit-opt (map-get? deposits { user: tx-sender, token-id: safe-token-id })))
+          (if (is-some prev-deposit-opt)
+            (let ((prev-deposit (unwrap-panic prev-deposit-opt)))
+              (map-set deposits 
+                { user: tx-sender, token-id: safe-token-id }
+                { 
+                  amount: (+ amount (get amount prev-deposit)), 
+                  deposit-height: current-height 
+                }
+              ))
             (map-set deposits 
-              { user: tx-sender, token-id: token-id }
-              { 
-                amount: (+ amount (get amount prev-deposit)), 
-                deposit-height: current-height 
-              }
-            ))
-          (map-set deposits 
-            { user: tx-sender, token-id: token-id }
-            { amount: amount, deposit-height: current-height }
+              { user: tx-sender, token-id: safe-token-id }
+              { amount: amount, deposit-height: current-height }
+            )
           )
         )
-      )
-      
-      ;; Handle token transfers
-      (let ((transfer-result 
-             (if (is-eq token-id TOKEN-STX)
-               (stx-transfer? amount tx-sender (as-contract tx-sender))
-               ;; For other tokens like xBTC, you would use ft-transfer?
-               (err ERR-UNSUPPORTED-TOKEN))))
         
-        ;; Check if deposit transfer was successful
-        (asserts! (is-ok transfer-result) (err ERR-DEPOSIT-TRANSFER-FAILED))
-        
-        ;; Return success response
-        (ok true)
+        ;; Handle token transfers
+        (let ((transfer-result 
+               (if (is-eq safe-token-id TOKEN-STX)
+                 (stx-transfer? amount tx-sender (as-contract tx-sender))
+                 ;; For other tokens like xBTC, you would use ft-transfer?
+                 (err ERR-UNSUPPORTED-TOKEN))))
+          
+          ;; Check if deposit transfer was successful
+          (asserts! (is-ok transfer-result) (err ERR-DEPOSIT-TRANSFER-FAILED))
+          
+          ;; Return success response
+          (ok true)
+        )
       )
     )
   )
@@ -143,63 +156,69 @@
 
 ;; Withdraw deposited tokens plus any accrued interest
 (define-public (withdraw (token-id (string-ascii 10)) (amount uint))
-  (let 
-    ((user-deposit-opt (map-get? deposits { user: tx-sender, token-id: token-id })))
+  (begin
+    ;; Validate token
+    (asserts! (is-valid-token token-id) (err ERR-INVALID-TOKEN))
     
-    ;; Check if deposit exists
-    (asserts! (is-some user-deposit-opt) (err ERR-NO-DEPOSIT))
-    
-    (let
-      ((user-deposit (unwrap-panic user-deposit-opt))
-       (pool-opt (map-get? token-pools { token-id: token-id })))
+    (let 
+      ((safe-token-id token-id) ;; Create a safe copy after validation
+       (user-deposit-opt (map-get? deposits { user: tx-sender, token-id: safe-token-id })))
       
-      ;; Check if pool exists
-      (asserts! (is-some pool-opt) (err ERR-POOL-NOT-FOUND))
+      ;; Check if deposit exists
+      (asserts! (is-some user-deposit-opt) (err ERR-NO-DEPOSIT))
       
       (let
-        ((pool (unwrap-panic pool-opt))
-         (current-height block-height)
-         (blocks-elapsed (- current-height (get deposit-height user-deposit)))
-         (interest-rate (get interest-rate pool))
-         
-         ;; Calculate accrued interest (simple interest calculation)
-         (blocks-per-year u52560) ;; Assuming ~10 minute blocks, ~144 blocks per day, ~52,560 per year
-         (time-factor (/ (* blocks-elapsed u10000) blocks-per-year))
-         (interest (/ (* amount interest-rate time-factor) u1000000))
-         (withdraw-amount (+ amount interest)))
+        ((user-deposit (unwrap-panic user-deposit-opt))
+         (pool-opt (map-get? token-pools { token-id: safe-token-id })))
         
-        ;; Ensure user has sufficient balance
-        (asserts! (<= amount (get amount user-deposit)) (err ERR-INSUFFICIENT-BALANCE))
+        ;; Check if pool exists
+        (asserts! (is-some pool-opt) (err ERR-POOL-NOT-FOUND))
         
-        ;; Update user's deposit
-        (map-set deposits 
-          { user: tx-sender, token-id: token-id }
-          { 
-            amount: (- (get amount user-deposit) amount), 
-            deposit-height: (if (is-eq (- (get amount user-deposit) amount) u0) 
-                             u0 
-                             current-height)
-          }
-        )
-        
-        ;; Update pool's total deposited amount
-        (map-set token-pools 
-          { token-id: token-id } 
-          (merge pool { total-deposited: (- (get total-deposited pool) amount) })
-        )
-        
-        ;; Transfer tokens back to user
-        (let ((withdraw-result
-               (if (is-eq token-id TOKEN-STX)
-                 (as-contract (stx-transfer? withdraw-amount (as-contract tx-sender) tx-sender))
-                 ;; For other tokens like xBTC, would use ft-transfer?
-                 (err ERR-UNSUPPORTED-TOKEN))))
+        (let
+          ((pool (unwrap-panic pool-opt))
+           (current-height block-height)
+           (blocks-elapsed (- current-height (get deposit-height user-deposit)))
+           (interest-rate (get interest-rate pool))
+           
+           ;; Calculate accrued interest (simple interest calculation)
+           (blocks-per-year u52560) ;; Assuming ~10 minute blocks, ~144 blocks per day, ~52,560 per year
+           (time-factor (/ (* blocks-elapsed u10000) blocks-per-year))
+           (interest (/ (* amount interest-rate time-factor) u1000000))
+           (withdraw-amount (+ amount interest)))
           
-          ;; Check if withdrawal transfer was successful
-          (asserts! (is-ok withdraw-result) (err ERR-WITHDRAWAL-TRANSFER-FAILED))
+          ;; Ensure user has sufficient balance
+          (asserts! (<= amount (get amount user-deposit)) (err ERR-INSUFFICIENT-BALANCE))
           
-          ;; Return success response
-          (ok true)
+          ;; Update user's deposit
+          (map-set deposits 
+            { user: tx-sender, token-id: safe-token-id }
+            { 
+              amount: (- (get amount user-deposit) amount), 
+              deposit-height: (if (is-eq (- (get amount user-deposit) amount) u0) 
+                               u0 
+                               current-height)
+            }
+          )
+          
+          ;; Update pool's total deposited amount
+          (map-set token-pools 
+            { token-id: safe-token-id } 
+            (merge pool { total-deposited: (- (get total-deposited pool) amount) })
+          )
+          
+          ;; Transfer tokens back to user
+          (let ((withdraw-result
+                 (if (is-eq safe-token-id TOKEN-STX)
+                   (as-contract (stx-transfer? withdraw-amount (as-contract tx-sender) tx-sender))
+                   ;; For other tokens like xBTC, would use ft-transfer?
+                   (err ERR-UNSUPPORTED-TOKEN))))
+            
+            ;; Check if withdrawal transfer was successful
+            (asserts! (is-ok withdraw-result) (err ERR-WITHDRAWAL-TRANSFER-FAILED))
+            
+            ;; Return success response
+            (ok true)
+          )
         )
       )
     )
@@ -214,75 +233,84 @@
   (collateral-amount uint)
   (duration uint)
 )
-  (let 
-    ((loan-id (var-get next-loan-id))
-     (borrower tx-sender)
-     (current-height block-height)
-     (lendable-pool-opt (map-get? token-pools { token-id: token-id }))
-     (collateral-pool-opt (map-get? token-pools { token-id: collateral-token-id })))
+  (begin
+    ;; Validate tokens
+    (asserts! (is-valid-token token-id) (err ERR-INVALID-TOKEN))
+    (asserts! (is-valid-token collateral-token-id) (err ERR-INVALID-TOKEN))
     
-    ;; Check if pools exist
-    (asserts! (is-some lendable-pool-opt) (err ERR-POOL-NOT-FOUND))
-    (asserts! (is-some collateral-pool-opt) (err ERR-POOL-NOT-FOUND))
-    
-    (let
-      ((lendable-pool (unwrap-panic lendable-pool-opt))
-       (collateral-pool (unwrap-panic collateral-pool-opt))
-       ;; Calculate required collateral based on collateral ratio
-       (collateral-ratio (get collateral-ratio lendable-pool))
-       (required-collateral (/ (* amount collateral-ratio) u10000)))
+    (let 
+      ((safe-token-id token-id) ;; Create safe copies after validation
+       (safe-collateral-token-id collateral-token-id)
+       (safe-duration duration)
+       (loan-id (var-get next-loan-id))
+       (borrower tx-sender)
+       (current-height block-height)
+       (lendable-pool-opt (map-get? token-pools { token-id: safe-token-id }))
+       (collateral-pool-opt (map-get? token-pools { token-id: safe-collateral-token-id })))
       
-      ;; Ensure sufficient funds are available in the pool
-      (asserts! (>= (- (get total-deposited lendable-pool) (get total-borrowed lendable-pool)) amount) (err ERR-INSUFFICIENT-POOL-FUNDS))
+      ;; Check if pools exist
+      (asserts! (is-some lendable-pool-opt) (err ERR-POOL-NOT-FOUND))
+      (asserts! (is-some collateral-pool-opt) (err ERR-POOL-NOT-FOUND))
       
-      ;; Ensure sufficient collateral is provided
-      (asserts! (>= collateral-amount required-collateral) (err ERR-INSUFFICIENT-COLLATERAL))
-      
-      ;; Create the loan
-      (map-set loans
-        { borrower: borrower, loan-id: loan-id }
-        {
-          amount: amount,
-          collateral: collateral-amount,
-          token-id: token-id,
-          collateral-token-id: collateral-token-id,
-          interest-rate: (get interest-rate lendable-pool),
-          start-height: current-height,
-          duration: duration,
-          liquidated: false
-        }
-      )
-      
-      ;; Update the pool's total borrowed amount
-      (map-set token-pools
-        { token-id: token-id }
-        (merge lendable-pool { total-borrowed: (+ (get total-borrowed lendable-pool) amount) })
-      )
-      
-      ;; Increment the next loan ID
-      (var-set next-loan-id (+ loan-id u1))
-      
-      ;; Transfer collateral from borrower to contract
-      (let ((collateral-transfer-result
-             (if (is-eq collateral-token-id TOKEN-STX)
-               (stx-transfer? collateral-amount borrower (as-contract tx-sender))
-               ;; For other tokens like xBTC, would use ft-transfer?
-               (err ERR-UNSUPPORTED-TOKEN))))
+      (let
+        ((lendable-pool (unwrap-panic lendable-pool-opt))
+         (collateral-pool (unwrap-panic collateral-pool-opt))
+         ;; Calculate required collateral based on collateral ratio
+         (collateral-ratio (get collateral-ratio lendable-pool))
+         (required-collateral (/ (* amount collateral-ratio) u10000)))
         
-        ;; Check if collateral transfer was successful
-        (asserts! (is-ok collateral-transfer-result) (err ERR-COLLATERAL-TRANSFER-FAILED))
+        ;; Ensure sufficient funds are available in the pool
+        (asserts! (>= (- (get total-deposited lendable-pool) (get total-borrowed lendable-pool)) amount) (err ERR-INSUFFICIENT-POOL-FUNDS))
         
-        ;; Transfer borrowed amount to borrower
-        (let ((borrow-transfer-result 
-               (if (is-eq token-id TOKEN-STX)
-                 (as-contract (stx-transfer? amount (as-contract tx-sender) borrower))
+        ;; Ensure sufficient collateral is provided
+        (asserts! (>= collateral-amount required-collateral) (err ERR-INSUFFICIENT-COLLATERAL))
+        
+        ;; Create the loan
+        (map-set loans
+          { borrower: borrower, loan-id: loan-id }
+          {
+            amount: amount,
+            collateral: collateral-amount,
+            token-id: safe-token-id,
+            collateral-token-id: safe-collateral-token-id,
+            interest-rate: (get interest-rate lendable-pool),
+            start-height: current-height,
+            duration: safe-duration,
+            liquidated: false
+          }
+        )
+        
+        ;; Update the pool's total borrowed amount
+        (map-set token-pools
+          { token-id: safe-token-id }
+          (merge lendable-pool { total-borrowed: (+ (get total-borrowed lendable-pool) amount) })
+        )
+        
+        ;; Increment the next loan ID
+        (var-set next-loan-id (+ loan-id u1))
+        
+        ;; Transfer collateral from borrower to contract
+        (let ((collateral-transfer-result
+               (if (is-eq safe-collateral-token-id TOKEN-STX)
+                 (stx-transfer? collateral-amount borrower (as-contract tx-sender))
                  ;; For other tokens like xBTC, would use ft-transfer?
                  (err ERR-UNSUPPORTED-TOKEN))))
           
-          ;; Check if borrow transfer was successful
-          (asserts! (is-ok borrow-transfer-result) (err ERR-BORROW-TRANSFER-FAILED))
+          ;; Check if collateral transfer was successful
+          (asserts! (is-ok collateral-transfer-result) (err ERR-COLLATERAL-TRANSFER-FAILED))
           
-          (ok loan-id)
+          ;; Transfer borrowed amount to borrower
+          (let ((borrow-transfer-result 
+                 (if (is-eq safe-token-id TOKEN-STX)
+                   (as-contract (stx-transfer? amount (as-contract tx-sender) borrower))
+                   ;; For other tokens like xBTC, would use ft-transfer?
+                   (err ERR-UNSUPPORTED-TOKEN))))
+            
+            ;; Check if borrow transfer was successful
+            (asserts! (is-ok borrow-transfer-result) (err ERR-BORROW-TRANSFER-FAILED))
+            
+            (ok loan-id)
+          )
         )
       )
     )
@@ -292,7 +320,8 @@
 ;; Repay a loan
 (define-public (repay-loan (loan-id uint) (amount uint))
   (let 
-    ((loan-opt (map-get? loans { borrower: tx-sender, loan-id: loan-id })))
+    ((safe-loan-id loan-id) ;; Create a safe copy after validation
+     (loan-opt (map-get? loans { borrower: tx-sender, loan-id: safe-loan-id })))
     
     ;; Check if loan exists
     (asserts! (is-some loan-opt) (err ERR-LOAN-NOT-FOUND))
@@ -349,7 +378,7 @@
                 (asserts! (is-ok collateral-return-result) (err ERR-COLLATERAL-RETURN-FAILED))
                 
                 ;; Delete the loan
-                (map-delete loans { borrower: tx-sender, loan-id: loan-id })
+                (map-delete loans { borrower: tx-sender, loan-id: safe-loan-id })
                 
                 ;; Update the pool's total borrowed amount
                 (map-set token-pools
@@ -365,7 +394,7 @@
             (begin
               ;; Update loan amount
               (map-set loans
-                { borrower: tx-sender, loan-id: loan-id }
+                { borrower: tx-sender, loan-id: safe-loan-id }
                 (merge loan { amount: (- (get amount loan) amount) })
               )
               
@@ -382,7 +411,9 @@
 ;; Liquidate an undercollateralized loan
 (define-public (liquidate-loan (borrower principal) (loan-id uint))
   (let 
-    ((loan-opt (map-get? loans { borrower: borrower, loan-id: loan-id })))
+    ((safe-borrower borrower) ;; Create safe copies after validation
+     (safe-loan-id loan-id)
+     (loan-opt (map-get? loans { borrower: safe-borrower, loan-id: safe-loan-id })))
     
     ;; Check if loan exists
     (asserts! (is-some loan-opt) (err ERR-LOAN-NOT-FOUND))
@@ -421,7 +452,7 @@
         
         ;; Mark loan as liquidated
         (map-set loans
-          { borrower: borrower, loan-id: loan-id }
+          { borrower: safe-borrower, loan-id: safe-loan-id }
           (merge loan { liquidated: true })
         )
         
@@ -453,7 +484,10 @@
 
 ;; Get user deposit information
 (define-read-only (get-user-deposit (user principal) (token-id (string-ascii 10)))
-  (map-get? deposits { user: user, token-id: token-id })
+  (if (is-valid-token token-id)
+    (map-get? deposits { user: user, token-id: token-id })
+    none
+  )
 )
 
 ;; Get loan information
@@ -463,7 +497,10 @@
 
 ;; Get pool information
 (define-read-only (get-pool (token-id (string-ascii 10)))
-  (map-get? token-pools { token-id: token-id })
+  (if (is-valid-token token-id)
+    (map-get? token-pools { token-id: token-id })
+    none
+  )
 )
 
 ;; Update pool parameters (admin only)
@@ -475,11 +512,14 @@
 )
   (begin
     (asserts! (is-eq tx-sender (var-get admin)) (err ERR-UNAUTHORIZED))
-    (let ((pool-opt (map-get? token-pools { token-id: token-id })))
+    (asserts! (is-valid-token token-id) (err ERR-INVALID-TOKEN))
+    
+    (let ((safe-token-id token-id)
+          (pool-opt (map-get? token-pools { token-id: safe-token-id })))
       (asserts! (is-some pool-opt) (err ERR-POOL-NOT-FOUND))
       (let ((pool (unwrap-panic pool-opt)))
         (map-set token-pools
-          { token-id: token-id }
+          { token-id: safe-token-id }
           (merge pool {
             interest-rate: interest-rate,
             collateral-ratio: collateral-ratio,
