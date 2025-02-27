@@ -57,10 +57,32 @@
 (define-constant ERR-WITHDRAWAL-TRANSFER-FAILED u1016)
 (define-constant ERR-BORROW-TRANSFER-FAILED u1017)
 (define-constant ERR-INVALID-TOKEN u1018)
+(define-constant ERR-INVALID-DURATION u1019)
+(define-constant ERR-INVALID-LOAN-ID u1020)
+(define-constant ERR-INVALID-PRINCIPAL u1021)
+(define-constant ERR-INVALID-ADMIN u1022)
 
 ;; Function to validate token-id
 (define-private (is-valid-token (token-id (string-ascii 10)))
   (or (is-eq token-id TOKEN-STX) (is-eq token-id TOKEN-XBTC))
+)
+
+;; Function to validate duration
+(define-private (is-valid-duration (duration uint))
+  ;; Ensure duration is reasonable (e.g., between 1 day and 365 days in blocks)
+  (and (>= duration u144) (<= duration u52560))
+)
+
+;; Function to validate loan-id
+(define-private (is-valid-loan-id (loan-id uint))
+  ;; Ensure loan-id is within reasonable bounds and exists
+  (< loan-id (var-get next-loan-id))
+)
+
+;; Function to validate principal
+(define-private (is-valid-principal (user principal))
+  ;; Basic principal validation
+  (not (is-eq user (as-contract tx-sender)))
 )
 
 ;; Initialize protocol with default settings
@@ -238,10 +260,13 @@
     (asserts! (is-valid-token token-id) (err ERR-INVALID-TOKEN))
     (asserts! (is-valid-token collateral-token-id) (err ERR-INVALID-TOKEN))
     
+    ;; Validate duration
+    (asserts! (is-valid-duration duration) (err ERR-INVALID-DURATION))
+    
     (let 
       ((safe-token-id token-id) ;; Create safe copies after validation
        (safe-collateral-token-id collateral-token-id)
-       (safe-duration duration)
+       (safe-duration duration) ;; Now validated
        (loan-id (var-get next-loan-id))
        (borrower tx-sender)
        (current-height block-height)
@@ -319,87 +344,92 @@
 
 ;; Repay a loan
 (define-public (repay-loan (loan-id uint) (amount uint))
-  (let 
-    ((safe-loan-id loan-id) ;; Create a safe copy after validation
-     (loan-opt (map-get? loans { borrower: tx-sender, loan-id: safe-loan-id })))
+  (begin
+    ;; Validate loan-id
+    (asserts! (is-valid-loan-id loan-id) (err ERR-INVALID-LOAN-ID))
     
-    ;; Check if loan exists
-    (asserts! (is-some loan-opt) (err ERR-LOAN-NOT-FOUND))
-    
-    (let
-      ((loan (unwrap-panic loan-opt))
-       (current-height block-height)
-       (blocks-elapsed (- current-height (get start-height loan)))
-       
-       ;; Calculate interest accrued
-       (blocks-per-year u52560)
-       (time-factor (/ (* blocks-elapsed u10000) blocks-per-year))
-       (interest-rate (get interest-rate loan))
-       (interest (/ (* (get amount loan) interest-rate time-factor) u1000000))
-       (total-owed (+ (get amount loan) interest))
-       
-       ;; Get pool data
-       (lendable-pool-opt (map-get? token-pools { token-id: (get token-id loan) })))
+    (let 
+      ((safe-loan-id loan-id) ;; Now validated
+       (loan-opt (map-get? loans { borrower: tx-sender, loan-id: safe-loan-id })))
       
-      ;; Check if pool exists
-      (asserts! (is-some lendable-pool-opt) (err ERR-POOL-NOT-FOUND))
+      ;; Check if loan exists
+      (asserts! (is-some loan-opt) (err ERR-LOAN-NOT-FOUND))
       
       (let
-        ((lendable-pool (unwrap-panic lendable-pool-opt)))
+        ((loan (unwrap-panic loan-opt))
+         (current-height block-height)
+         (blocks-elapsed (- current-height (get start-height loan)))
+         
+         ;; Calculate interest accrued
+         (blocks-per-year u52560)
+         (time-factor (/ (* blocks-elapsed u10000) blocks-per-year))
+         (interest-rate (get interest-rate loan))
+         (interest (/ (* (get amount loan) interest-rate time-factor) u1000000))
+         (total-owed (+ (get amount loan) interest))
+         
+         ;; Get pool data
+         (lendable-pool-opt (map-get? token-pools { token-id: (get token-id loan) })))
         
-        ;; Ensure the loan hasn't been liquidated
-        (asserts! (not (get liquidated loan)) (err ERR-LIQUIDATED-LOAN))
+        ;; Check if pool exists
+        (asserts! (is-some lendable-pool-opt) (err ERR-POOL-NOT-FOUND))
         
-        ;; Ensure repayment amount is sufficient
-        (asserts! (>= amount (if (< amount total-owed) amount total-owed)) (err ERR-INSUFFICIENT-REPAYMENT))
-        
-        ;; Transfer repayment from borrower to contract
-        (let ((repayment-result
-               (if (is-eq (get token-id loan) TOKEN-STX)
-                 (stx-transfer? amount tx-sender (as-contract tx-sender))
-                 ;; For other tokens like xBTC, would use ft-transfer?
-                 (err ERR-UNSUPPORTED-TOKEN))))
+        (let
+          ((lendable-pool (unwrap-panic lendable-pool-opt)))
           
-          ;; Check if repayment transfer was successful
-          (asserts! (is-ok repayment-result) (err ERR-REPAYMENT-TRANSFER-FAILED))
+          ;; Ensure the loan hasn't been liquidated
+          (asserts! (not (get liquidated loan)) (err ERR-LIQUIDATED-LOAN))
           
-          ;; Process repayment
-          (if (>= amount total-owed)
-            ;; Full repayment
-            (begin
-              ;; Return collateral
-              (let ((collateral-return-result
-                     (if (is-eq (get collateral-token-id loan) TOKEN-STX)
-                       (as-contract (stx-transfer? (get collateral loan) (as-contract tx-sender) tx-sender))
-                       ;; For other tokens like xBTC, would use ft-transfer?
-                       (err ERR-UNSUPPORTED-TOKEN))))
-                
-                ;; Check if collateral return was successful
-                (asserts! (is-ok collateral-return-result) (err ERR-COLLATERAL-RETURN-FAILED))
-                
-                ;; Delete the loan
-                (map-delete loans { borrower: tx-sender, loan-id: safe-loan-id })
-                
-                ;; Update the pool's total borrowed amount
-                (map-set token-pools
-                  { token-id: (get token-id loan) }
-                  (merge lendable-pool { total-borrowed: (- (get total-borrowed lendable-pool) (get amount loan)) })
+          ;; Ensure repayment amount is sufficient
+          (asserts! (>= amount (if (< amount total-owed) amount total-owed)) (err ERR-INSUFFICIENT-REPAYMENT))
+          
+          ;; Transfer repayment from borrower to contract
+          (let ((repayment-result
+                 (if (is-eq (get token-id loan) TOKEN-STX)
+                   (stx-transfer? amount tx-sender (as-contract tx-sender))
+                   ;; For other tokens like xBTC, would use ft-transfer?
+                   (err ERR-UNSUPPORTED-TOKEN))))
+            
+            ;; Check if repayment transfer was successful
+            (asserts! (is-ok repayment-result) (err ERR-REPAYMENT-TRANSFER-FAILED))
+            
+            ;; Process repayment
+            (if (>= amount total-owed)
+              ;; Full repayment
+              (begin
+                ;; Return collateral
+                (let ((collateral-return-result
+                       (if (is-eq (get collateral-token-id loan) TOKEN-STX)
+                         (as-contract (stx-transfer? (get collateral loan) (as-contract tx-sender) tx-sender))
+                         ;; For other tokens like xBTC, would use ft-transfer?
+                         (err ERR-UNSUPPORTED-TOKEN))))
+                  
+                  ;; Check if collateral return was successful
+                  (asserts! (is-ok collateral-return-result) (err ERR-COLLATERAL-RETURN-FAILED))
+                  
+                  ;; Delete the loan - loan-id is now validated above
+                  (map-delete loans { borrower: tx-sender, loan-id: safe-loan-id })
+                  
+                  ;; Update the pool's total borrowed amount
+                  (map-set token-pools
+                    { token-id: (get token-id loan) }
+                    (merge lendable-pool { total-borrowed: (- (get total-borrowed lendable-pool) (get amount loan)) })
+                  )
+                  
+                  ;; Return success
+                  (ok true)
+                )
+              )
+              ;; Partial repayment
+              (begin
+                ;; Update loan amount
+                (map-set loans
+                  { borrower: tx-sender, loan-id: safe-loan-id }
+                  (merge loan { amount: (- (get amount loan) amount) })
                 )
                 
                 ;; Return success
                 (ok true)
               )
-            )
-            ;; Partial repayment
-            (begin
-              ;; Update loan amount
-              (map-set loans
-                { borrower: tx-sender, loan-id: safe-loan-id }
-                (merge loan { amount: (- (get amount loan) amount) })
-              )
-              
-              ;; Return success
-              (ok true)
             )
           )
         )
@@ -410,72 +440,78 @@
 
 ;; Liquidate an undercollateralized loan
 (define-public (liquidate-loan (borrower principal) (loan-id uint))
-  (let 
-    ((safe-borrower borrower) ;; Create safe copies after validation
-     (safe-loan-id loan-id)
-     (loan-opt (map-get? loans { borrower: safe-borrower, loan-id: safe-loan-id })))
+  (begin
+    ;; Validate borrower and loan-id
+    (asserts! (is-valid-principal borrower) (err ERR-INVALID-PRINCIPAL))
+    (asserts! (is-valid-loan-id loan-id) (err ERR-INVALID-LOAN-ID))
     
-    ;; Check if loan exists
-    (asserts! (is-some loan-opt) (err ERR-LOAN-NOT-FOUND))
-    
-    (let
-      ((loan (unwrap-panic loan-opt))
-       (current-height block-height)
-       (blocks-elapsed (- current-height (get start-height loan)))
-       
-       ;; Calculate current loan value with interest
-       (blocks-per-year u52560)
-       (time-factor (/ (* blocks-elapsed u10000) blocks-per-year))
-       (interest-rate (get interest-rate loan))
-       (interest (/ (* (get amount loan) interest-rate time-factor) u1000000))
-       (total-owed (+ (get amount loan) interest))
-       
-       ;; Get pool data for liquidation threshold
-       (lendable-pool-opt (map-get? token-pools { token-id: (get token-id loan) })))
+    (let 
+      ((safe-borrower borrower) ;; Now validated
+       (safe-loan-id loan-id) ;; Now validated
+       (loan-opt (map-get? loans { borrower: safe-borrower, loan-id: safe-loan-id })))
       
-      ;; Check if pool exists
-      (asserts! (is-some lendable-pool-opt) (err ERR-POOL-NOT-FOUND))
+      ;; Check if loan exists
+      (asserts! (is-some loan-opt) (err ERR-LOAN-NOT-FOUND))
       
       (let
-        ((lendable-pool (unwrap-panic lendable-pool-opt))
-         (liquidation-threshold (get liquidation-threshold lendable-pool))
+        ((loan (unwrap-panic loan-opt))
+         (current-height block-height)
+         (blocks-elapsed (- current-height (get start-height loan)))
          
-         ;; Calculate current collateral value (would need price oracles in real implementation)
-         (current-collateral-value (get collateral loan))
+         ;; Calculate current loan value with interest
+         (blocks-per-year u52560)
+         (time-factor (/ (* blocks-elapsed u10000) blocks-per-year))
+         (interest-rate (get interest-rate loan))
+         (interest (/ (* (get amount loan) interest-rate time-factor) u1000000))
+         (total-owed (+ (get amount loan) interest))
          
-         ;; Calculate minimum required collateral
-         (min-collateral-required (/ (* total-owed liquidation-threshold) u10000)))
+         ;; Get pool data for liquidation threshold
+         (lendable-pool-opt (map-get? token-pools { token-id: (get token-id loan) })))
         
-        ;; Ensure the loan is eligible for liquidation
-        (asserts! (not (get liquidated loan)) (err ERR-LIQUIDATED-LOAN))
-        (asserts! (< current-collateral-value min-collateral-required) (err ERR-NOT-LIQUIDATABLE))
+        ;; Check if pool exists
+        (asserts! (is-some lendable-pool-opt) (err ERR-POOL-NOT-FOUND))
         
-        ;; Mark loan as liquidated
-        (map-set loans
-          { borrower: safe-borrower, loan-id: safe-loan-id }
-          (merge loan { liquidated: true })
-        )
-        
-        ;; Update the pool's total borrowed amount
-        (map-set token-pools
-          { token-id: (get token-id loan) }
-          (merge lendable-pool { total-borrowed: (- (get total-borrowed lendable-pool) (get amount loan)) })
-        )
-        
-        ;; Transfer collateral to liquidator (with discount)
         (let
-          ((liquidation-bonus u9500) ;; 95% of collateral (5% discount)
-           (liquidator-amount (/ (* current-collateral-value liquidation-bonus) u10000))
-           (transfer-result (if (is-eq (get collateral-token-id loan) TOKEN-STX)
-                              (as-contract (stx-transfer? liquidator-amount (as-contract tx-sender) tx-sender))
-                              ;; For other tokens like xBTC, would use ft-transfer?
-                              (err ERR-UNSUPPORTED-TOKEN))))
+          ((lendable-pool (unwrap-panic lendable-pool-opt))
+           (liquidation-threshold (get liquidation-threshold lendable-pool))
+           
+           ;; Calculate current collateral value (would need price oracles in real implementation)
+           (current-collateral-value (get collateral loan))
+           
+           ;; Calculate minimum required collateral
+           (min-collateral-required (/ (* total-owed liquidation-threshold) u10000)))
           
-          ;; Check if liquidation transfer was successful
-          (asserts! (is-ok transfer-result) (err ERR-LIQUIDATION-TRANSFER-FAILED))
+          ;; Ensure the loan is eligible for liquidation
+          (asserts! (not (get liquidated loan)) (err ERR-LIQUIDATED-LOAN))
+          (asserts! (< current-collateral-value min-collateral-required) (err ERR-NOT-LIQUIDATABLE))
           
-          ;; Return success
-          (ok true)
+          ;; Mark loan as liquidated
+          (map-set loans
+            { borrower: safe-borrower, loan-id: safe-loan-id }
+            (merge loan { liquidated: true })
+          )
+          
+          ;; Update the pool's total borrowed amount
+          (map-set token-pools
+            { token-id: (get token-id loan) }
+            (merge lendable-pool { total-borrowed: (- (get total-borrowed lendable-pool) (get amount loan)) })
+          )
+          
+          ;; Transfer collateral to liquidator (with discount)
+          (let
+            ((liquidation-bonus u9500) ;; 95% of collateral (5% discount)
+             (liquidator-amount (/ (* current-collateral-value liquidation-bonus) u10000))
+             (transfer-result (if (is-eq (get collateral-token-id loan) TOKEN-STX)
+                                (as-contract (stx-transfer? liquidator-amount (as-contract tx-sender) tx-sender))
+                                ;; For other tokens like xBTC, would use ft-transfer?
+                                (err ERR-UNSUPPORTED-TOKEN))))
+            
+            ;; Check if liquidation transfer was successful
+            (asserts! (is-ok transfer-result) (err ERR-LIQUIDATION-TRANSFER-FAILED))
+            
+            ;; Return success
+            (ok true)
+          )
         )
       )
     )
@@ -536,6 +572,8 @@
 (define-public (transfer-admin (new-admin principal))
   (begin
     (asserts! (is-eq tx-sender (var-get admin)) (err ERR-UNAUTHORIZED))
+    ;; Validate new admin
+    (asserts! (is-valid-principal new-admin) (err ERR-INVALID-ADMIN))
     (var-set admin new-admin)
     (ok true)
   )
